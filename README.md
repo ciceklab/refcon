@@ -19,7 +19,7 @@ python scripts/fetch_data.py          # pulls data + checkpoints from Zenodo (se
 ```
 Tested with PyTorch 2.10 on CUDA 12.8 and on Apple Silicon (MPS).
 
-**New here?** [`quickstart.ipynb`](quickstart.ipynb) runs the whole pipeline end to end: install,
+[`quickstart.ipynb`](quickstart.ipynb) runs the whole pipeline end to end: install,
 fetch, reference-free inference on one cohort, and per-cell copy-number visualization (GPU/MPS/CPU).
 
 ## Inference
