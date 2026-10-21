@@ -3,13 +3,14 @@
 **Reference-free copy-number inference from single-cell RNA-seq.**
 
 REFCON is a deep-learning model that predicts a genome-wide, per-cell copy-number profile from
-scRNA-seq expression alone, without any reference panel, diploid baseline, or in-sample normal cells. It estimates local copy-number deviations within short windows of neighboring genes and
-stitches them into each cell's genome-wide profile. Trained once on cell lines with bulk-DNA
-copy-number labels and applied without per-dataset tuning, it generalizes across cell lines, tissues,
-and platforms (10x, Smart-seq2, DNTR-seq, scONE-seq, BD Rhapsody).
+scRNA-seq expression alone, without any reference panel, diploid baseline, or in-sample normal cells. It estimates
+local copy-number deviations within short windows of neighboring genes and stitches them into each cell's
+genome-wide profile. Trained once on cell lines with bulk-DNA copy-number labels and on healthy cells labelled
+diploid, and applied without per-dataset tuning, it generalizes across cell lines, tissues, and platforms (10x,
+Smart-seq2, DNTR-seq, scONE-seq, BD Rhapsody).
 
-Outputs are relative copy-number ratios (per-cell mean = 1), not absolute copy number or ploidy. The
-reported model is a 3-checkpoint ensemble (`ens3`) over context lengths 512, 1024, and 2048.
+Outputs are relative copy-number ratios (per-cell mean = 1), not absolute copy number or ploidy. REFCON averages two
+models with a context of 2,048 genes per window, trained with different seeds.
 
 ## Install
 ```bash
@@ -17,6 +18,7 @@ conda create -n refcon python=3.12 && conda activate refcon
 pip install -e .                      # installs REFCON + dependencies (pyproject.toml)
 python scripts/fetch_data.py          # pulls data + checkpoints from Zenodo (see data/README.md)
 ```
+The checkpoints are `checkpoints/refcon_v3_s2.pt` and `checkpoints/refcon_v3_s3.pt`.
 Tested with PyTorch 2.10 on CUDA 12.8 and on Apple Silicon (MPS).
 
 [`quickstart.ipynb`](quickstart.ipynb) runs the whole pipeline end to end: install,
@@ -25,62 +27,90 @@ fetch, reference-free inference on one cohort, and per-cell copy-number visualiz
 ## Inference
 ```bash
 python scripts/infer.py --data your_sample.h5ad --out out/your_sample --device cuda:0
-# -> out/your_sample/ens3_cn.npz  (cn ratios, cells, genes) + runtime.json
+# -> out/your_sample/refcon_cn.npz  (cn ratios, spread between the two models, cells, genes) + runtime.json
+# --cell-batch: cells per forward call (default 512; the output does not depend on it)
+# --forward-only: skip the reversed pass (half the model passes, slightly lower accuracy)
 ```
-The input is a raw-UMI `.h5ad` with genomic-ordered genes and a `chr_boundary` column; see
+The input is a raw-UMI `.h5ad` with genomic-ordered genes, a `chr_boundary` column, and each gene's
+`chromosome` and `start` in GRCh38 (every window carries its genes' positions in megabases); see
 [`docs/input_format.md`](docs/input_format.md). `--device` accepts `cuda:N`, `mps`, or `cpu`.
 
 To score predictions against per-cell copy-number ground truth:
 ```bash
-python scripts/score.py --pred out/your_sample/ens3_cn.npz --gt your_sample_cn.npy
+python scripts/score.py --pred out/your_sample/refcon_cn.npz --gt your_sample_cn.npy
 ```
 The bundled per-cell-DNA cohorts and their expected metrics are in
 [`docs/reproduce.md`](docs/reproduce.md).
 
 ## Downstream tumor/normal classification
 ```bash
-python scripts/classify.py --data your_sample.h5ad --cn out/your_sample/ens3_cn.npz
+python scripts/classify.py --data your_sample.h5ad --cn out/your_sample/refcon_cn.npz
 ```
-Confident-diploid detection (marker enrichment on expression), then GMM clustering on the CN
-predictions, then per-cluster Pearson labeling (T=0.75), with a pure-sample dispersion fallback
-(T_sigma=0.135). The confident-diploid cells only label clusters; they are not used to compute the
-copy-number profiles.
+Confident-normal detection (marker enrichment on expression), then GMM clustering on the CN
+predictions, then per-cluster labeling: a cluster is aneuploid if the median per-cell dispersion of
+its cells is at least tau1 = 1.05 times that of the confident-normal cells, with a pure-sample
+dispersion fallback (T_sigma = 0.125). The confident-normal cells only label clusters; they are not used to compute
+the copy-number profiles.
+
+## Optional refinement with diploid cells
+```bash
+python -m refcon.refine --data your_sample.h5ad --cn out/your_sample/refcon_cn.npz
+# -> out/your_sample/refcon_cn_refined.npz; diploid cells = the confident-normal cells REFCON detects itself
+# --ref-col <obs column> --ref-label <value>: refine against annotated normal cells instead; --svd-k (default 3)
+```
+Refinement removes the model's systematic bias using the sample's diploid cells (per-gene bias, top-k SVD modes,
+per-cell renormalization). It runs after classification and does not change any label.
 
 ## Training
 ```bash
 python scripts/train.py --train-data /path/to/train_cohorts --val-data /path/to/val_cohorts \
     --device cuda:0 --out-dir checkpoints/
 ```
-Trains the three ensemble members (C = 512/1024/2048) with the paper hyperparameters (AdamW lr 1e-4,
-wd 0.01, batch 64, grad-clip 1.0, ReduceLROnPlateau, early-stop 30, seed 42, bin_size 8, SmoothL1 +
-variance floor). `--train-data` and `--val-data` each point at a directory (or single file) of
-processed `.h5ad` cohorts; see [`docs/input_format.md`](docs/input_format.md). Training data is not
-bundled (see Data availability in the paper).
+Trains three models at context length 2048 (seeds 1, 2, 3) and keeps the two with the higher
+validation Pearson as `refcon_v3_s<seed>.pt`. Recipe:
+- training data: every cohort of `--train-data`, the cell lines and 4,200 Tabula Sapiens v2 healthy cells
+  labelled diploid (see [`data/README.md`](data/README.md));
+- windows: half are bridge windows across the boundary of two adjacent chromosomes (each chromosome with
+  its own start offset, so the boundary stays on a bin edge), half are reversed, and every window starts
+  0 to 7 genes later;
+- robustness: thinning of the counts (half of the windows, rate log-uniform in [0.1, 1]), gene removal
+  (a quarter, up to 50% of the genes) and gene zeroing (a quarter, up to 30%); targets never change;
+- model: rotary positions in megabases and chromosome separation;
+- optimisation: SmoothL1 (Huber) loss, AdamW lr 1e-4, wd 0.01, batch 64, grad-clip 1.0, bin_size 8; a
+  fixed cosine decay of the learning rate to 1e-6 over 150 epochs;
+- checkpoint: every epoch the complete inference pipeline is scored on monitoring cells of the
+  validation lines; snapshots every 10 epochs; a run's weights are the snapshot at the peak of the
+  10-epoch moving average of that score.
+
+`--exclude-lines` removes cell lines from the training data (matched on `obs` `cell_line`, `Cell_line` or
+`cn_profile`). `--train-data` and `--val-data` each point at a directory (or single file) of processed `.h5ad`
+cohorts; see [`docs/input_format.md`](docs/input_format.md). Training data is not bundled (see Data availability
+in the paper).
 
 ## Repository layout
 ```
 refcon/
   refcon/                    importable package
-    model.py                 RoPE Transformer backbone (MaskedConvStemTransformer)
+    model.py                 rotary-position Transformer backbone (MaskedConvStemTransformer)
     model_binned_dev.py      BinnedDevModel: masked InstanceNorm -> Conv binner -> Transformer -> ratio head
-    eval_cellwide.py         single-checkpoint cell-wide inference (windows + bridges + joint LSQ stitch)
+    eval_cellwide.py         single-model cell-wide inference (windows + bridges + joint LSQ stitch)
     data.py                  dataset loading (chromosome-chunked)
-    train_binned_dev.py      training loop for one ensemble member
-    refine.py                optional reference-cell SVD refinement
+    train_binned_dev.py      training loop for one model
+    refine.py                optional reference-cell SVD refinement (python -m refcon.refine)
     metrics.py               per-cell / per-line CN metrics
-    downstream/              confident-diploid markers + tumor/normal classifier
+    downstream/              confident-normal markers + tumor/normal classifier
   scripts/
-    infer.py                 ens3 inference -> ens3_cn.npz + runtime.json
+    infer.py                 inference with both models -> refcon_cn.npz + runtime.json
     score.py                 score predictions vs per-cell CN ground truth
     classify.py              downstream tumor/normal classification
-    train.py                 train the three ensemble members
+    train.py                 train the models
     fetch_data.py            fetch data + checkpoints from Zenodo
   data/                      evaluation cohorts (from Zenodo; one subdirectory per cohort)
-  checkpoints/               ensemble_bs8_mc512.pt, baseline_bs8_mc1024.pt, ensemble_bs8_mc2048.pt
+  checkpoints/               refcon_v3_s2.pt, refcon_v3_s3.pt (from Zenodo)
   docs/                      input_format.md, reproduce.md
 ```
 
 ## Data & citation
-Processed cohorts and checkpoints are on Zenodo (`scripts/fetch_data.py`); primary data accessions are
-listed in the paper's Data availability. If you use REFCON, please cite the paper (see the manuscript
-for the current reference).
+Processed cohorts and checkpoints are on Zenodo (https://doi.org/10.5281/zenodo.23534511), fetched by
+`scripts/fetch_data.py`; primary data accessions are listed in the paper's Data availability. If you use REFCON,
+please cite the paper (see the manuscript for the current reference) and the Zenodo record.

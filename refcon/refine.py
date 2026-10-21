@@ -28,16 +28,19 @@ Usage (programmatic):
     # ref_mask: (n_cells,) bool - True for known diploid cells
     pred_refined = calibrate_predictions(pred, ref_mask, svd_k=3)
 
-Usage (CLI):
+Usage (CLI), on the output of scripts/infer.py:
 
-    python -m refcon.refine \\
-        --predictions path/to/eval_cellwide_output.pt \\
-        --data path/to/cohort.h5ad \\
-        --output path/to/refined.pt
+    python -m refcon.refine --data sample.h5ad --cn out/sample/refcon_cn.npz
+        # diploid cells = the confident-normal cells REFCON detects itself from expression
+    python -m refcon.refine --data sample.h5ad --cn out/sample/refcon_cn.npz \\
+        --ref-col cn_role --ref-label reference
+        # diploid cells = annotated normal cells (obs column / value)
+    -> out/sample/refcon_cn_refined.npz (keys cn, cells, genes, ref_mask, svd_k)
 """
 from __future__ import annotations
 
 import argparse
+import warnings
 from pathlib import Path
 import numpy as np
 
@@ -90,7 +93,9 @@ def calibrate_predictions(
     if winsor_range is not None:
         lo, hi = winsor_range
         refs = np.clip(refs, lo, hi)
-    bias = np.nanmean(refs, axis=0) - 1.0
+    with np.errstate(all="ignore"), warnings.catch_warnings():   # genes without any prediction stay NaN
+        warnings.simplefilter("ignore", RuntimeWarning)
+        bias = np.nanmean(refs, axis=0) - 1.0
     bias = np.where(np.isfinite(bias), bias, 0.0)
 
     # Step 2: subtract per-gene bias from all cells
@@ -129,56 +134,54 @@ def extract_ref_mask_from_h5ad(h5ad_path: str | Path,
     if role_col not in a.obs.columns:
         raise ValueError(f"Column '{role_col}' not found in h5ad obs. "
                          f"Available: {list(a.obs.columns)}")
-    return (a.obs[role_col].values == ref_label)
+    return (a.obs[role_col].astype(str).values == ref_label)
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Post-hoc reference-cell refinement for REFCON outputs."
-    )
-    ap.add_argument("--predictions", required=True,
-                    help="Path to .pt file from eval_cellwide.py")
-    ap.add_argument("--data", required=True,
-                    help="Path to input .h5ad (used to extract the reference-cell mask)")
-    ap.add_argument("--ref-col", default="cn_role",
-                    help="obs column identifying ref cells (default: cn_role)")
-    ap.add_argument("--ref-label", default="reference",
-                    help="Value in --ref-col marking ref cells (default: reference)")
-    ap.add_argument("--output", required=True,
-                    help="Path to save calibrated predictions (.pt)")
-    ap.add_argument("--svd-k", type=int, default=3,
-                    help="SVD principal components to remove (default: 3)")
-    ap.add_argument("--winsor-lo", type=float, default=None,
-                    help="Optional winsorize lower bound")
-    ap.add_argument("--winsor-hi", type=float, default=None,
-                    help="Optional winsorize upper bound")
+    import anndata as ad
+    import scipy.sparse as sp
+    from .downstream.markers import ssmww_confident_normal
+
+    ap = argparse.ArgumentParser(description="Post-hoc reference-cell refinement for REFCON outputs.")
+    ap.add_argument("--data", required=True, help="raw-UMI .h5ad of the sample (cells as in --cn)")
+    ap.add_argument("--cn", required=True, help="refcon_cn.npz from scripts/infer.py")
+    ap.add_argument("--ref-col", default=None,
+                    help="obs column marking annotated diploid cells (default: self-detected confident-normal cells)")
+    ap.add_argument("--ref-label", default=None, help="value of --ref-col that marks the diploid cells")
+    ap.add_argument("--svd-k", type=int, default=3, help="SVD principal components to remove (default: 3)")
+    ap.add_argument("--winsor-lo", type=float, default=None, help="Optional winsorize lower bound")
+    ap.add_argument("--winsor-hi", type=float, default=None, help="Optional winsorize upper bound")
+    ap.add_argument("--out", default=None, help="output .npz (default: <cn>_refined.npz)")
     args = ap.parse_args()
 
-    import torch
-    print(f"Loading {args.predictions} ...", flush=True)
-    d = torch.load(args.predictions, map_location="cpu", weights_only=False)
-    pred = d["predicted_cn_ratios"]  # (n_cells, n_genes)
-    if hasattr(pred, "numpy"):
-        pred = pred.numpy()
-    pred = np.asarray(pred, dtype=np.float32)
-    print(f"  predictions shape: {pred.shape}", flush=True)
+    d = np.load(args.cn, allow_pickle=True)
+    cn, cells, genes = d["cn"].astype(np.float64), d["cells"].astype(str), d["genes"].astype(str)
+    A = ad.read_h5ad(args.data)
+    pos = {c: i for i, c in enumerate(np.asarray(A.obs_names).astype(str))}
+    missing = [c for c in cells if c not in pos]
+    if missing:
+        raise SystemExit(f"{len(missing)} cells of --cn are not in --data (first: {missing[0]})")
+    rows = np.array([pos[c] for c in cells])
 
-    print(f"Extracting ref mask from {args.data} ...", flush=True)
-    ref_mask = extract_ref_mask_from_h5ad(args.data, args.ref_col, args.ref_label)
-    print(f"  refs: {ref_mask.sum()} / {len(ref_mask)}", flush=True)
+    if args.ref_col is not None:
+        if args.ref_label is None:
+            raise SystemExit("--ref-col needs --ref-label")
+        ref = (A.obs[args.ref_col].astype(str).values == args.ref_label)[rows]
+        source = f"annotated ({args.ref_col} == {args.ref_label})"
+    else:
+        counts = A.X.toarray() if sp.issparse(A.X) else np.asarray(A.X)
+        ref = ssmww_confident_normal(counts, np.asarray(A.var_names).astype(str))["norm_mask"].astype(bool)[rows]
+        source = "self-detected confident-normal"
+    if ref.sum() < 3:
+        raise SystemExit(f"only {int(ref.sum())} diploid cells ({source}); the refinement needs at least 3")
 
     winsor = None
     if args.winsor_lo is not None and args.winsor_hi is not None:
         winsor = (args.winsor_lo, args.winsor_hi)
-    print(f"Calibrating: svd_k={args.svd_k}  winsor={winsor}", flush=True)
-    calibrated = calibrate_predictions(pred, ref_mask, svd_k=args.svd_k,
-                                        winsor_range=winsor)
-
-    d["predicted_cn_ratios_calibrated"] = torch.from_numpy(calibrated)
-    d["calibration_config"] = {"svd_k": args.svd_k, "winsor_range": winsor,
-                                 "n_refs": int(ref_mask.sum())}
-    torch.save(d, args.output)
-    print(f"Saved calibrated predictions to {args.output}", flush=True)
+    refined = calibrate_predictions(cn, ref, svd_k=args.svd_k, winsor_range=winsor).astype(np.float32)
+    out = Path(args.out) if args.out else Path(args.cn).with_name(Path(args.cn).stem + "_refined.npz")
+    np.savez_compressed(out, cn=refined, cells=cells, genes=genes, ref_mask=ref, svd_k=args.svd_k)
+    print(f"diploid cells: {int(ref.sum())} of {len(ref)} ({source}); svd_k={args.svd_k}; wrote {out}")
 
 
 if __name__ == "__main__":

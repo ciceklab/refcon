@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "refcon"
-version = "1.0.0"
+version = "2.0.0"
 description = "REFCON: reference-free per-gene copy-number inference from scRNA-seq"
 readme = "README.md"
 requires-python = ">=3.10"
