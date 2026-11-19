@@ -18,11 +18,22 @@ conda create -n refcon python=3.12 && conda activate refcon
 pip install -e .                      # installs REFCON + dependencies (pyproject.toml)
 python scripts/fetch_data.py          # pulls data + checkpoints from Zenodo (see data/README.md)
 ```
-The checkpoints are `checkpoints/refcon_v3_s2.pt` and `checkpoints/refcon_v3_s3.pt`.
-Tested with PyTorch 2.10 on CUDA 12.8 and on Apple Silicon (MPS).
 
 [`quickstart.ipynb`](quickstart.ipynb) runs the whole pipeline end to end: install,
 fetch, reference-free inference on one cohort, and per-cell copy-number visualization (GPU/MPS/CPU).
+
+## System requirements
+REFCON is pure Python (3.10 or newer; developed with 3.12). It runs on Linux and macOS and needs no non-standard
+hardware: a GPU (NVIDIA CUDA or Apple Silicon) is optional and a laptop CPU is enough for the demo. Dependencies and
+the versions used for the paper are in `requirements.txt`. Tested on Ubuntu 22.04.5 LTS with PyTorch 2.10
+(CUDA 12.8, NVIDIA GeForce RTX 2080 Ti) and on macOS 15.7 (Apple M4 Pro) with PyTorch 2.10 and 2.15.
+
+Installation takes about one minute on a desktop computer, and `scripts/fetch_data.py` downloads 166 MB (under a minute).
+
+## Demo
+The A375 cohort (96 cells) is the demo; commands and expected metrics are in [`docs/reproduce.md`](docs/reproduce.md).
+Inference takes about 20 seconds on an Apple M4 Pro GPU and about 1.5 minutes on its CPU, and scoring prints Pearson
+0.470, Spearman 0.479, AUROC loss 0.734 and AUROC gain 0.759.
 
 ## Inference
 ```bash
